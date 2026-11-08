@@ -43,6 +43,7 @@ const listFile = option('--list', null);
 const out = option('--out', null);
 const jobs = Number(option('--jobs', Math.max(1, Math.min(8, os.cpus().length - 1))));
 const explain = option('--explain', null);
+if (explain && !siddump) { console.error('--explain compares with siddump, so it needs --siddump <exe>'); process.exit(2); }
 // Extra harness options, for experiments: --harness-arg --ntsc --harness-arg --flat-io
 const harnessArgs = args.flatMap((a, i) => (a === '--harness-arg' ? [args[i + 1]] : []));
 const compiler = process.env.CXX ?? 'c++';

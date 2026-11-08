@@ -3,7 +3,7 @@
 // native harness with a PSID built here: the driver calls init and play at the
 // rate the header asks for, writes are recorded with their cycles, and the
 // header rules from SID_file_format.txt are enforced.
-import test from 'node:test';
+import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -19,10 +19,13 @@ const NOT_CI = ['', '0', 'false'];
 const inCi = !NOT_CI.includes(process.env.CI ?? '');
 const skip = !commandExists('c++') && !inCi && 'c++ is not on PATH';
 
-let harnessPath, dir;
+// One directory for the built harness and every PSID the tests write, gone when they are done.
+const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sidhost-'));
+after(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+let harnessPath;
 function harness() {
   if (harnessPath) return harnessPath;
-  dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sidhost-'));
   harnessPath = path.join(dir, 'harness');
   const built = spawnSync('c++', ['-std=gnu++17', '-O2', '-Wall', '-Wextra', '-I', HOST_DIR, '-o', harnessPath,
     HARNESS_SOURCE, path.join(HOST_DIR, 'SidMachine.cpp')], { encoding: 'utf8' });
@@ -32,10 +35,11 @@ function harness() {
 
 // A PSID v2 whose init stores the song number and sets the volume, and whose
 // play counts calls into $D400 and echoes the song into $D401.
-function makePsid({ magic = 'PSID', load = 0x1000, loadInHeader = true, speed = 0b10, songs = 2, play = load + 0x10, init = load, kernalExit = false } = {}) {
+function makePsid({ magic = 'PSID', load = 0x1000, loadInHeader = true, speed = 0b10, songs = 2, play = load + 0x10, init = load, kernalExit = false, sid2 = 0 } = {}) {
   const header = Buffer.alloc(0x7C);
   header.write(magic, 0, 'latin1');
-  header.writeUInt16BE(2, 4);
+  header.writeUInt16BE(sid2 ? 3 : 2, 4);
+  if (sid2) header[0x7A] = sid2;             // v3: the second SID's address, middle byte of $Dxx0
   header.writeUInt16BE(0x7C, 6);
   header.writeUInt16BE(loadInHeader ? load : 0, 8);
   header.writeUInt16BE(init, 0x0A);
@@ -64,7 +68,7 @@ function makePsid({ magic = 'PSID', load = 0x1000, loadInHeader = true, speed = 
   ]).copy(code, 0x10);
   code[0x30] = 0; code[0x31] = 0;    // song, count
   const prefix = loadInHeader ? Buffer.alloc(0) : Buffer.from([lo(load), hi(load)]);
-  const file = path.join(dir ?? fs.mkdtempSync(path.join(os.tmpdir(), 'sidhost-')), `t${Math.random().toString(36).slice(2)}.sid`);
+  const file = path.join(dir, `t${Math.random().toString(36).slice(2)}.sid`);
   fs.writeFileSync(file, Buffer.concat([header, prefix, code]));
   return file;
 }
@@ -127,6 +131,16 @@ test('the trace lists every SID write with its cycle, in order', { skip }, () =>
   const playWrites = writes.slice(1);
   assert.deepEqual(playWrites.slice(0, 2).map((w) => w[1]), ['D400', 'D401']);
   assert.ok(cycles[1] >= 19656 && cycles[1] < 2 * 19656, `first play write lands in the second frame: ${cycles[1]}`);
+});
+
+test('a second SID at $DFE0 does not take the driver marker for one of its writes', { skip }, () => {
+  harness();
+  const got = run(makePsid({ sid2: 0xFE }), ['-n', '3']);
+  assert.equal(got.status, 0);
+  assert.match(got.header, / rows calls$/);
+  assert.deepEqual(got.rows.map((r) => r[0]), [1, 2, 3], got.notes.join('; '));
+  const trace = spawnSync(harness(), [makePsid({ sid2: 0xFE }), '-n', '2', '--trace'], { encoding: 'utf8' }).stdout;
+  assert.ok(!/ DFFF /.test(trace), 'the marker store is not a recorded write');
 });
 
 test('headers the format description says to reject are rejected', { skip }, () => {

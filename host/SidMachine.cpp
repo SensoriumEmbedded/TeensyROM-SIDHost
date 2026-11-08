@@ -297,8 +297,10 @@ void SidMachine::ioWrite(uint16_t a, uint8_t v)
    }
    if (a < 0xDC00) { mem_.color[a & 0x3FF] = v & 0x0F; return; }
    if (a < 0xDE00) { ciaImage_[(a >> 8) & 1][a & 0x0F] = v; ciaSel_ = (uint8_t)(1 + ((a >> 8) & 1)); return; }
-   if (inSid(sid2_, a) || inSid(sid3_, a)) { record(a, v); return; }
-   if (a == DRIVER_MARKER) playCalls_++;
+   // The driver's marker store is told from a tune's own write to the same address by
+   // where it comes from: a second or third SID can sit at $DFE0-$DFFF.
+   if (a == DRIVER_MARKER && (cpu_.PC >> 8) == driverPage_) { playCalls_++; return; }
+   if (inSid(sid2_, a) || inSid(sid3_, a)) record(a, v);
 }
 
 // ------------------------------------------------------------------ clock

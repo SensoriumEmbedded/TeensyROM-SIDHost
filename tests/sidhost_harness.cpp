@@ -89,6 +89,7 @@ int main(int argc, char **argv)
 
    int printed = 0, frames = 0;
    uint32_t seenCalls = 0;
+   bool overflowed = false;   // a frame held more writes than the buffer; the writes are cleared per frame
    auto row = [&]() {
       printf("%d", printed);
       for (int r = 0; r < 25; r++) printf(" %02X", m.sidRegs()[r]);
@@ -113,13 +114,14 @@ int main(int argc, char **argv)
          printed = frames;
          continue;
       }
-      if (rowsPerFrame) { m.runFrame(); frames++; row(); continue; }
+      if (rowsPerFrame) { m.clearWrites(); m.runFrame(); frames++; overflowed |= m.writeOverflow(); row(); continue; }
       for (uint32_t n = m.cyclesPerFrame(); n && printed < rows; n--)
       {
          m.tick();
          if (m.playCalls() != seenCalls) { seenCalls = m.playCalls(); row(); }
       }
       frames++;
+      overflowed |= m.writeOverflow();
       // A tune whose init installs its own interrupt handler never comes back
       // through the driver, so its play address is never called by it; its
       // writes still happen, so from here on a row is a frame.
@@ -130,6 +132,7 @@ int main(int argc, char **argv)
       }
       if (!rowsPerFrame) m.clearWrites();
    }
+   if (!trace && overflowed) printf("# write buffer overflow: a frame held more than %u SID writes\n", (unsigned)writes.size());
    if (!trace && m.mirrorWrites()) printf("# %u SID writes went through mirror addresses\n", m.mirrorWrites());
    if (!trace && m.portReads()) printf("# %u reads of $00/$01 by the tune\n", m.portReads());
    if (!trace && printed < rows)

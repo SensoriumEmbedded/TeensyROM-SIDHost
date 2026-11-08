@@ -44,7 +44,7 @@ public:
    static constexpr uint32_t PAL_CYCLES_PER_LINE = 63, PAL_LINES = 312;
    static constexpr uint32_t NTSC_CYCLES_PER_LINE = 65, NTSC_LINES = 263;
    static constexpr uint16_t PAL_TIMER = 0x4025, NTSC_TIMER = 0x4295;  // 60 Hz CIA periods the format description names
-   static constexpr uint16_t DRIVER_MARKER = 0xDFFF;                    // the driver stores here when play returns
+   static constexpr uint16_t DRIVER_MARKER = 0xDFFF;                    // the driver stores here when play returns; a tune's own write there is a SID 2/3 write
 
    void init(const SidMachineMem &mem, bool ntsc);
    bool load(const SidHeader &h);     // remembers the tune and picks the driver page; false if no page is free
