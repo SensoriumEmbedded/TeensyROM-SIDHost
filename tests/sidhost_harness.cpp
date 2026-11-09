@@ -24,14 +24,15 @@ static void usage()
       "  --max-frames <n>     give up after this many frames without the rows arriving (default 4x rows)\n"
       "  --flat-io     VIC and CIA registers read back what was written, like a timing-free reference\n"
       "  --io-reads    print every read of $D000-$DFFF and $00/$01 as 'cycle pc addr value', per frame\n"
-      "  --zero-regs   enter play with A=X=Y=0, as siddump does (experiment)\n");
+      "  --zero-regs   enter play with A=X=Y=0, as siddump does (experiment)\n"
+      "  --no-fast-idle  tick every cycle of the driver's idle loop (the reference for the fast-forward)\n");
 }
 
 int main(int argc, char **argv)
 {
    const char *path = nullptr;
    int song = -1, rows = 3000, maxFrames = -1, clock = 0;
-   bool trace = false, rowsPerFrame = false, rowsSet = false, flatIo = false, ioReads = false, zeroRegs = false;
+   bool trace = false, rowsPerFrame = false, rowsSet = false, flatIo = false, ioReads = false, zeroRegs = false, fastIdle = true;
    for (int i = 1; i < argc; i++)
    {
       std::string a = argv[i];
@@ -47,6 +48,7 @@ int main(int argc, char **argv)
       else if (a == "--flat-io") flatIo = true;
       else if (a == "--io-reads") { ioReads = true; trace = true; }
       else if (a == "--zero-regs") zeroRegs = true;
+      else if (a == "--no-fast-idle") fastIdle = false;
       else if (a[0] == '-') { usage(); return 2; }
       else path = argv[i];
    }
@@ -75,6 +77,7 @@ int main(int argc, char **argv)
    m.setWriteBuffer(writes.data(), (uint32_t)writes.size());
    m.flatIo = flatIo;
    m.zeroRegsAtPlay = zeroRegs;
+   m.fastIdle = fastIdle;
    if (ioReads) m.setReadLog(reads.data(), (uint32_t)reads.size());
    m.start((uint8_t)song);
 
@@ -135,6 +138,7 @@ int main(int argc, char **argv)
    if (!trace && overflowed) printf("# write buffer overflow: a frame held more than %u SID writes\n", (unsigned)writes.size());
    if (!trace && m.mirrorWrites()) printf("# %u SID writes went through mirror addresses\n", m.mirrorWrites());
    if (!trace && m.portReads()) printf("# %u reads of $00/$01 by the tune\n", m.portReads());
+   if (trace) printf("# %u idle cycles skipped\n", m.idleCyclesSkipped());
    if (!trace && printed < rows)
    {
       const SidMachine::Probe q = m.probe();

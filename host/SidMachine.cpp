@@ -121,6 +121,7 @@ void SidMachine::installDriver(uint8_t song0)
    emit({0x78, 0xD8, 0xA2, 0xFF, 0x9A, 0xA9, 0x2F, 0x85, 0x00, 0xA9, bankFor(tune_.initAddr), 0x85, 0x01});
    emit({0xA9, song0, 0xA2, 0x00, 0xA0, 0x00, 0x20, lo(tune_.initAddr), hi(tune_.initAddr), 0x58});
    const uint8_t idle = n;
+   idleAddr_ = (uint16_t)(base + idle);
    emit({0x4C, lo(base + idle), hi(base + idle)});
    const uint8_t nmi = n;
    emit({0x40});
@@ -178,6 +179,7 @@ void SidMachine::start(uint8_t song0)
    vicIrq_ = 0;
    cycle_ = 0;
    playCalls_ = 0;
+   skipped_ = 0;
    clearWrites();
 
    // The format description's default environment: CIA 1 timer A at 60 Hz and
@@ -351,7 +353,84 @@ void SidMachine::tick()
    cycle_++;
 }
 
+// ------------------------------------------------------------------ idle fast-forward
+//
+// Between play calls the 6502 sits in the driver's JMP idle, which leaves the CPU in the
+// same state every 3 cycles and touches nothing but its own three bytes. While the CIAs only
+// count and the raster counter only advances, those cycles can be added up instead of ticked.
+// The skip stops IdleMargin cycles short of the next event (a timer underflow, the raster
+// compare line, the end of the frame), so the event itself is ticked as before and every SID
+// write keeps the cycle it had.
+
+static constexpr uint32_t IdleMargin = 8;
+
+// A timer that only counts or only sits: no load, underflow or start/stop in its pipeline.
+// running says which of the two it is.
+static bool timerSteady(const m6526_timer_t &t, bool counts, bool &running)
+{
+   if (t.t_out || t.t_load || M6526_FORCE_LOAD(t.cr) || ((t.pip >> M6526_PIP_TIMER_LOAD) & 0xFF)) return false;
+   running = M6526_TIMER_STARTED(t.cr) && counts;
+   return (t.pip & 0xFF) == (running ? 0x03u : 0x00u);
+}
+
+// Narrows span to the cycles this CIA can be advanced without ticking; false if it cannot be.
+static bool ciaSpan(const m6526_t &c, uint32_t &span)
+{
+   const m6526_int_t &i = c.intr;
+   if (i.pip || i.ir_now || i.irq || i.imr != i.imr1 || (i.icr & i.imr1 & 0x1F)) return false;
+   bool ta, tb;
+   // Timer B counting timer A underflows sits still while A does not underflow.
+   if (!timerSteady(c.ta, M6526_TA_INMODE_PHI2(c.ta.cr), ta) || !timerSteady(c.tb, M6526_TB_INMODE_PHI2(c.tb.cr), tb)) return false;
+   for (const m6526_timer_t *t : {ta ? &c.ta : nullptr, tb ? &c.tb : nullptr})
+   {
+      if (!t) continue;
+      const uint32_t until = t->counter ? t->counter : 0x10000;  // ticks to the underflow
+      if (until <= IdleMargin) return false;
+      if (until - IdleMargin < span) span = until - IdleMargin;
+   }
+   return true;
+}
+
+// The cycles from here that can be skipped, a multiple of the idle loop's 3; 0 when the CPU is
+// not at the top of the loop or something is about to happen.
+uint32_t SidMachine::idleSpan(uint32_t limit) const
+{
+   if (!(pins_ & M6502_SYNC) || M6502_GET_ADDR(pins_) != idleAddr_) return 0;
+   if ((pins_ & (M6502_IRQ | M6502_NMI)) || cpu_.irq_pip || cpu_.nmi_pip || cpu_.brk_flags) return 0;
+   uint32_t span = limit;
+   if (!ciaSpan(cia1_, span) || !ciaSpan(cia2_, span)) return 0;
+   if (rasterCmp_ < linesPerFrame_)
+   {
+      // The tick that ends a line starts the next one; the one that starts the compare line latches the interrupt.
+      const uint32_t lines = (rasterCmp_ + linesPerFrame_ - line_ - 1) % linesPerFrame_;
+      const uint32_t until = cyclesPerLine_ - lineCycle_ + lines * cyclesPerLine_;
+      if (until <= IdleMargin) return 0;
+      if (until - IdleMargin < span) span = until - IdleMargin;
+   }
+   return span / 3 * 3;
+}
+
+void SidMachine::skipIdle(uint32_t cycles)
+{
+   for (m6526_t *c : {&cia1_, &cia2_})
+   {
+      bool running;
+      if (timerSteady(c->ta, M6526_TA_INMODE_PHI2(c->ta.cr), running) && running) c->ta.counter = (uint16_t)(c->ta.counter - cycles);
+      if (timerSteady(c->tb, M6526_TB_INMODE_PHI2(c->tb.cr), running) && running) c->tb.counter = (uint16_t)(c->tb.counter - cycles);
+   }
+   const uint32_t at = lineCycle_ + cycles;
+   line_ = (uint16_t)((line_ + at / cyclesPerLine_) % linesPerFrame_);
+   lineCycle_ = (uint16_t)(at % cyclesPerLine_);
+   cycle_ += cycles;
+   skipped_ += cycles;
+}
+
 void SidMachine::runFrame()
 {
-   for (uint32_t n = cyclesPerFrame(); n; n--) tick();
+   for (uint32_t n = cyclesPerFrame(); n;)
+   {
+      const uint32_t skip = fastIdle ? idleSpan(n) : 0;
+      if (skip) { skipIdle(skip); n -= skip; }
+      else { tick(); n--; }
+   }
 }

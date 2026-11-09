@@ -133,6 +133,23 @@ test('the trace lists every SID write with its cycle, in order', { skip }, () =>
   assert.ok(cycles[1] >= 19656 && cycles[1] < 2 * 19656, `first play write lands in the second frame: ${cycles[1]}`);
 });
 
+test('skipping the idle loop moves no SID write by a cycle, on the raster and on the CIA timer', { skip }, () => {
+  harness();
+  for (const song of ['0', '1']) {
+    const trace = (extra) => {
+      const out = spawnSync(harness(), [makePsid(), '-a', song, '-n', '50', '--trace', ...extra], { encoding: 'utf8' }).stdout;
+      const skipped = Number(/^# (\d+) idle cycles skipped$/m.exec(out)?.[1]);
+      return { writes: out.split(/\r?\n/).filter((l) => l && !l.startsWith('#')), skipped };
+    };
+    const fast = trace([]);
+    const slow = trace(['--no-fast-idle']);
+    assert.ok(fast.writes.length > 50, `song ${song}: ${fast.writes.length} writes`);
+    assert.ok(fast.skipped > 0, `song ${song}: the fast run skipped nothing`);
+    assert.equal(slow.skipped, 0, `song ${song}`);
+    assert.deepEqual(fast.writes, slow.writes, `song ${song}`);
+  }
+});
+
 test('a second SID at $DFE0 does not take the driver marker for one of its writes', { skip }, () => {
   harness();
   const got = run(makePsid({ sid2: 0xFE }), ['-n', '3']);

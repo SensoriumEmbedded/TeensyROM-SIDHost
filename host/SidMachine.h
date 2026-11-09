@@ -50,7 +50,7 @@ public:
    bool load(const SidHeader &h);     // remembers the tune and picks the driver page; false if no page is free
    void start(uint8_t song0);         // cold start: clears RAM, loads the tune, runs the driver for song0 (0-based)
    void tick();                       // one machine cycle
-   void runFrame();                   // one video frame of cycles
+   void runFrame();                   // one video frame of cycles, the driver's idle loop fast-forwarded
    uint32_t cyclesPerFrame() const { return cyclesPerLine_ * linesPerFrame_; }
    bool ntsc() const { return ntsc_; }
    uint16_t driverPage() const { return driverPage_; }
@@ -93,6 +93,10 @@ public:
    uint32_t mirrorWrites() const { return mirrorWrites_; }  // SID #1 writes made through $D420-$D7FF
    uint32_t portReads() const { return portReads_; }        // the tune's own reads of $00/$01 (not the driver's)
    bool zeroRegsAtPlay = false;  // experiment: enter play with A=X=Y=0, as siddump does
+   // runFrame skips the cycles the 6502 spends in the driver's idle loop up to the next
+   // event that can end it. Off, every cycle is ticked: the reference the harness compares with.
+   bool fastIdle = true;
+   uint32_t idleCyclesSkipped() const { return skipped_; }  // since start(): what fastIdle saved
 
 private:
    static uint8_t portIn(void *user);
@@ -106,6 +110,8 @@ private:
    void installDriver(uint8_t song0);
    static uint8_t bankFor(uint16_t addr);
    void record(uint16_t a, uint8_t v);
+   uint32_t idleSpan(uint32_t limit) const;
+   void skipIdle(uint32_t cycles);
 
    SidMachineMem mem_{};
    bool ntsc_ = false;
@@ -114,6 +120,7 @@ private:
    bool loaded_ = false;
    uint16_t driverPage_ = 0, playAddr_ = 0, sid2_ = 0, sid3_ = 0;
    uint16_t inPlayAddr_ = 0, afterPlayAddr_ = 0;  // the driver's flag byte and post-play continuation, which the pseudo-KERNAL exit uses
+   uint16_t idleAddr_ = 0;                        // the driver's JMP idle, which runFrame fast-forwards
 
    m6502_t cpu_{};
    m6526_t cia1_{}, cia2_{};
@@ -134,5 +141,5 @@ private:
    SidWrite *writes_ = nullptr;
    uint32_t writeCap_ = 0, writeCount_ = 0;
    bool writeOverflow_ = false;
-   uint32_t cycle_ = 0, playCalls_ = 0;
+   uint32_t cycle_ = 0, playCalls_ = 0, skipped_ = 0;
 };
