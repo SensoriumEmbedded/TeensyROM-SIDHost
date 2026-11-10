@@ -10,6 +10,7 @@
 #include <string>
 #include <vector>
 #include "SidMachine.h"
+#include "SidCalls.h"
 
 static void usage()
 {
@@ -25,7 +26,12 @@ static void usage()
       "  --flat-io     VIC and CIA registers read back what was written, like a timing-free reference\n"
       "  --io-reads    print every read of $D000-$DFFF and $00/$01 as 'cycle pc addr value', per frame\n"
       "  --zero-regs   enter play with A=X=Y=0, as siddump does (experiment)\n"
-      "  --no-fast-idle  tick every cycle of the driver's idle loop (the reference for the fast-forward)\n");
+      "  --no-fast-idle  tick every cycle of the driver's idle loop (the reference for the fast-forward)\n"
+      "  --calls       print each frame's bus calls, as the host replays them, and a summary\n"
+      "  --call-stats  the summary only\n"
+      "  --max-gap <n> cycles between two writes of one call, at most (default: the host's)\n"
+      "  --max-span <n>  cycles from a call's first write to its last, at most (default: the host's)\n"
+      "  --slot-calls <n> | --slot-writes <n>  a frame slot's capacity (default 1024 calls, 32768 writes)\n");
 }
 
 int main(int argc, char **argv)
@@ -33,6 +39,9 @@ int main(int argc, char **argv)
    const char *path = nullptr;
    int song = -1, rows = 3000, maxFrames = -1, clock = 0;
    bool trace = false, rowsPerFrame = false, rowsSet = false, flatIo = false, ioReads = false, zeroRegs = false, fastIdle = true;
+   bool calls = false, callList = false;
+   long maxGap = -1, maxSpanArg = -1;
+   int slotCalls = 1024, slotWrites = 1 << 15;
    for (int i = 1; i < argc; i++)
    {
       std::string a = argv[i];
@@ -49,6 +58,12 @@ int main(int argc, char **argv)
       else if (a == "--io-reads") { ioReads = true; trace = true; }
       else if (a == "--zero-regs") zeroRegs = true;
       else if (a == "--no-fast-idle") fastIdle = false;
+      else if (a == "--calls") calls = callList = true;
+      else if (a == "--call-stats") calls = true;
+      else if (a == "--max-gap") maxGap = atol(next());
+      else if (a == "--max-span") maxSpanArg = atol(next());
+      else if (a == "--slot-calls") slotCalls = atoi(next());
+      else if (a == "--slot-writes") slotWrites = atoi(next());
       else if (a[0] == '-') { usage(); return 2; }
       else path = argv[i];
    }
@@ -89,6 +104,49 @@ int main(int argc, char **argv)
           ntsc ? "NTSC" : "PAL", clock ? " (forced)" : "", sidSpeedIsCia(h, (uint16_t)song) ? "CIA" : "VBI",
           m.driverPage() << 8, rowsPerFrame ? "frames" : "calls");
    printf("# name \"%s\" author \"%s\" released \"%s\"\n", h.name, h.author, h.released);
+
+   if (calls)
+   {
+      // Frames as the host gets them: through the pair, both slots filled before one is taken.
+      std::vector<SidCall> callBuf[2] = {std::vector<SidCall>(slotCalls), std::vector<SidCall>(slotCalls)};
+      std::vector<BusWrite> busBuf[2] = {std::vector<BusWrite>(slotWrites), std::vector<BusWrite>(slotWrites)};
+      SidFramePair pair;
+      auto slot = [&](int i) { return SidFrame{callBuf[i].data(), busBuf[i].data(), (uint16_t)callBuf[i].size(), (uint16_t)busBuf[i].size(), 0, 0, 0, 0, false}; };
+      pair.init(slot(0), slot(1), writes.data(), (uint32_t)writes.size());
+      if (maxGap >= 0) pair.maxGap = (uint32_t)maxGap;
+      if (maxSpanArg >= 0) pair.maxSpan = (uint32_t)maxSpanArg;
+      uint64_t nCalls = 0, nWrites = 0, held = 0, cycles = 0;
+      uint32_t maxSpan = 0, maxCalls = 0, maxWrites = 0, overflows = 0;
+      for (int frame = 0; frame < rows; frame++)
+      {
+         while (pair.produce(m)) ;
+         const SidFrame &f = *pair.front();
+         if (callList) printf("F %u %u %u %u %u\n", f.number, f.startCycle, f.callCount, f.writeCount, f.overflow ? 1 : 0);
+         for (uint32_t c = 0; c < f.callCount; c++)
+         {
+            const SidCall &call = f.calls[c];
+            if (callList)
+            {
+               printf("C %u %u %u\n", call.at, call.span, call.count);
+               for (uint32_t i = call.first; i < (uint32_t)call.first + call.count; i++)
+                  printf("W %u %04X %02X\n", f.writes[i].offset, f.writes[i].addr, f.writes[i].value);
+            }
+            held += call.span + 1u;
+            if (call.span > maxSpan) maxSpan = call.span;
+         }
+         nCalls += f.callCount;
+         nWrites += f.writeCount;
+         cycles += m.cyclesPerFrame();
+         if (f.callCount > maxCalls) maxCalls = f.callCount;
+         if (f.writeCount > maxWrites) maxWrites = f.writeCount;
+         if (f.overflow) overflows++;
+         pair.release();
+      }
+      printf("# calls: frames %d gap %u span %u calls %llu writes %llu held %llu of %llu cycles, max span %u, max calls/frame %u, max writes/frame %u, overflowed frames %u\n",
+             rows, pair.maxGap, pair.maxSpan, (unsigned long long)nCalls, (unsigned long long)nWrites, (unsigned long long)held,
+             (unsigned long long)cycles, maxSpan, maxCalls, maxWrites, overflows);
+      return 0;
+   }
 
    int printed = 0, frames = 0;
    uint32_t seenCalls = 0;

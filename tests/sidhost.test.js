@@ -150,6 +150,69 @@ test('skipping the idle loop moves no SID write by a cycle, on the raster and on
   }
 });
 
+// The --calls listing: F <frame> <startCycle> <calls> <writes>, C <at> <span> <count>, W <offset> <addr> <value>.
+function callWrites(out) {
+  const got = [];
+  let start = 0, at = 0;
+  for (const l of out.split(/\r?\n/)) {
+    const f = l.split(' ');
+    if (f[0] === 'F') start = Number(f[2]);
+    else if (f[0] === 'C') at = start + Number(f[1]);
+    else if (f[0] === 'W') got.push(`${at + Number(f[1])} ${f[2]} ${f[3]}`);
+  }
+  return got;
+}
+
+test('the bus calls replay every traced write on its cycle, in order, and a long gap starts a new call', { skip }, () => {
+  harness();
+  for (const song of ['0', '1']) {
+    const file = makePsid();
+    const trace = spawnSync(harness(), [file, '-a', song, '-n', '50', '--trace'], { encoding: 'utf8' }).stdout
+      .split(/\r?\n/).filter((l) => l && !l.startsWith('#'));
+    for (const gap of ['0', '7', '8', '64']) {
+      const out = spawnSync(harness(), [file, '-a', song, '-n', '50', '--calls', '--max-gap', gap], { encoding: 'utf8' }).stdout;
+      assert.deepEqual(callWrites(out), trace, `song ${song} gap ${gap}`);
+      // Play stores $D400 and then $D401 8 cycles later (LDA abs, STA abs): one call when the gap allows 8.
+      const calls = out.split(/\r?\n/).filter((l) => l.startsWith('C ')).map((l) => l.split(' ').map(Number));
+      const play = calls.slice(1);
+      assert.ok(play.length > 0, `song ${song} gap ${gap}`);
+      if (Number(gap) >= 8) play.forEach((c) => assert.deepEqual([c[2], c[3]], [8, 2], `song ${song} gap ${gap}: ${c}`));
+      else play.forEach((c) => assert.deepEqual([c[2], c[3]], [0, 1], `song ${song} gap ${gap}: ${c}`));
+      const frames = out.split(/\r?\n/).filter((l) => l.startsWith('F ')).map((l) => l.split(' ').map(Number));
+      assert.deepEqual(frames.map((f) => f[1]), frames.map((_, i) => i), 'frames come out in order through both slots');
+      assert.ok(frames.every((f, i) => f[2] === 19656 * i), 'each frame starts a PAL frame after the last');
+    }
+  }
+});
+
+test('a call ends at the frame end and at the span cap, and a full slot drops the rest of its frame', { skip }, () => {
+  harness();
+  const file = makePsid();
+  const lines = (args) => spawnSync(harness(), [file, ...args], { encoding: 'utf8' }).stdout.split(/\r?\n/);
+  const parse = (out) => out.filter((l) => /^[FC] /.test(l)).map((l) => l.split(' ').map((v, i) => (i ? Number(v) : v)));
+  for (const song of ['0', '1']) {
+    const trace = lines(['-a', song, '-n', '50', '--trace']).filter((l) => l && !l.startsWith('#'));
+    // No gap or span limit: the frame end is the only cut, so each frame is one call that stays inside it.
+    const whole = lines(['-a', song, '-n', '50', '--calls', '--max-gap', '1000000', '--max-span', '1000000']);
+    assert.deepEqual(callWrites(whole.join('\n')), trace, `song ${song}, frame cuts only`);
+    for (const f of parse(whole).filter((r) => r[0] === 'F')) assert.ok(f[3] <= 1, `song ${song}: frame ${f[1]} has ${f[3]} calls`);
+    for (const c of parse(whole).filter((r) => r[0] === 'C')) assert.ok(c[1] + c[2] < 19656, `song ${song}: call ${c} crosses the frame end`);
+    // Play's two stores are 8 cycles apart: a 7-cycle cap splits them, an 8-cycle cap keeps them together.
+    for (const [cap, span, count] of [[7, 0, 1], [8, 8, 2]]) {
+      const out = lines(['-a', song, '-n', '50', '--calls', '--max-gap', '1000000', '--max-span', String(cap)]);
+      assert.deepEqual(callWrites(out.join('\n')), trace, `song ${song} span ${cap}`);
+      const play = parse(out).filter((r) => r[0] === 'C').slice(1);
+      play.forEach((c) => assert.deepEqual([c[2], c[3]], [span, count], `song ${song} span ${cap}: ${c}`));
+    }
+  }
+  // One write a slot: every play frame overflows, keeps its first write, and says so.
+  const small = lines(['-n', '10', '--calls', '--slot-writes', '1']);
+  const frames = parse(small).filter((r) => r[0] === 'F');
+  assert.ok(frames.slice(1).every((f) => f[4] === 1 && f[5] === 1), small.join('\n'));
+  assert.match(small.join('\n'), /overflowed frames 9\b/);
+  assert.deepEqual(small.filter((l) => l.startsWith('W ')).slice(1).map((l) => l.split(' ')[2]), Array(9).fill('D400'));
+});
+
 test('a second SID at $DFE0 does not take the driver marker for one of its writes', { skip }, () => {
   harness();
   const got = run(makePsid({ sid2: 0xFE }), ['-n', '3']);
