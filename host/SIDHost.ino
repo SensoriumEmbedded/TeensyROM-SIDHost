@@ -4,17 +4,17 @@
 // tune runs in (SidMachine) and replaying its SID writes to the real chip by DMA,
 // while the C64 itself runs only the small cartridge in Source/C64/SIDHostStub/.
 //
-// Phase 1 skeleton. It does everything around playing except the playing: it
-// boots from the launch record the menu's Shift+Return leaves, serves the
-// cartridge, draws the tune's header on the C64 screen by DMA, plays a test tone
-// on the SID by DMA, reads keys from the cartridge's mailbox, times the emulator
-// on this board, and hands the machine back to the menu.
+// It boots from the launch record the menu's Shift+Return leaves, serves the
+// cartridge, draws the tune's header on the C64 screen by DMA, times the emulator
+// on this board, plays the tune's start song (SidBus.h puts every write on its
+// cycle), reads keys from the cartridge's mailbox, and hands the machine back to
+// the menu.
 //
 //   node tools/build-firmware.mjs --target tr-plus --host-sketch Source/Teensy/SIDHost --host-code-kib 96
 //   python3 tools/bench/hostinstall.py build/firmware/TeensyROM+_<ver>_SIDHost.TRH
 //
-// Keys on the C64: T plays the test tone again, X returns to the menu (so does the
-// menu button, or resetting the C64).
+// Keys on the C64: X returns to the menu (so does the menu button, or resetting
+// the C64).
 
 #include <SD.h>
 #include <EEPROM.h>
@@ -41,6 +41,7 @@ Stream *CmdChannel = &Serial;
 #include "Common/VMFail.h"
 #include "Common/VMRegistry.h"
 #include "SidMachine.h"
+#include "SidBus.h"
 #include "SIDHostStub.bin.h"
 
 extern "C" uint32_t set_arm_clock(uint32_t frequency);
@@ -73,8 +74,12 @@ enum : uint32_t {
    FileAddr     = EmuColorAddr + 0x400,     // the .sid file: header, load address, 64 KB of data
    FileMax      = 0x7C + 2 + 0x10000,
    WritesAddr   = (FileAddr + FileMax + 31) & ~31u,
-   WritesMax    = 4096,
-   Ram2End      = WritesAddr + WritesMax * sizeof(SidWrite),
+   WritesMax    = 4096,                     // one frame's writes, before they are cut into calls
+   SlotCallsMax  = 1024,                    // per frame slot; the HVSC corpus peaks at 258 calls and 419 writes a frame
+   SlotWritesMax = WritesMax,
+   SlotCallsAddr  = WritesAddr + WritesMax * sizeof(SidWrite),
+   SlotWritesAddr = SlotCallsAddr + 2 * SlotCallsMax * sizeof(SidCall),
+   Ram2End      = SlotWritesAddr + 2 * SlotWritesMax * sizeof(BusWrite),
 };
 static_assert((uint32_t)Ram2End <= (uint32_t)VM_FAIL_BASE, "emulator buffers overlap the fail record");
 
@@ -82,10 +87,17 @@ enum : uint32_t {
    StubWaitmS      = 500,    // after reset release: no DMA in a C128's first ~80 mS, and the KERNAL init runs
    StubTimeoutmS   = 5000,   // a stub that has not said ready by then never will
    PollmS          = 20,     // mailbox reads, about once a frame
-   ToneOnmS        = 600,
    BenchFrames     = 50,
    DmaFailLimit    = 10,     // consecutive failed mailbox reads before giving up on the bus
+   StartLeadmS     = 20,     // the first frame is due this long after both slots are full
+   StatsmS         = 1000,
+   DmaGuarduS      = 300,    // a screen or mailbox transfer waits for a gap this long before the next call
+   DmaGuardWaitmS  = 20,     // but not longer: a tune that writes all the time leaves none
+   DmaIdleWaitmS   = 100,    // a call already holding the bus is over long before this
 };
+
+// The emulated machine's clock: the tune plays at its own rate on either machine.
+enum : uint32_t { PalClockHz = 985248, NtscClockHz = 1022727 };
 
 static SidMachine Machine;
 static SidHeader Tune;
@@ -93,7 +105,14 @@ static bool TuneLoaded;
 static char Status[41];           // why there is no tune, when there is none
 static char TunePath[sizeof(VmLaunchRecord::content)];
 
-static uint32_t ResetReleasedmS, LastPollmS, ToneOffmS;
+static SidFramePair Frames;
+static bool Playing;
+static uint32_t FramesReleased, Underruns, Overflows;
+static uint64_t NextBaseQ16;      // ARM cycle at which the next queued frame's cycle 0 is due, 16.16
+static uint32_t EmuFrames, EmuMaxArm;
+static uint64_t EmuTotalArm;
+
+static uint32_t ResetReleasedmS, LastPollmS, LastStatsmS;
 static bool StubReady;
 static uint8_t LastSeq, DmaFails;
 
@@ -101,6 +120,7 @@ static uint8_t LastSeq, DmaFails;
 
 FLASHMEM void ReturnToMenu(uint32_t detail)
 {
+   SidPlayer::end();
    SetResetAssert;
    VmFail::set(VmFail::HostReturned, detail);
    EEPROM.write(VM_EEP_BOOTIND_ADDR, VM_BOOT_FROM_MIN);
@@ -111,11 +131,24 @@ FLASHMEM void ReturnToMenu(uint32_t detail)
 
 // ------------------------------------------------------------ C64 by DMA
 
+static FLASHMEM void ServicePlayback();
+
 // One transfer, then the bus back to the 6510: PerformDMA leaves /DMA asserted, and the C64
-// stopped, until CloseDMA.
+// stopped, until CloseDMA. While a tune plays, the transfer goes between its calls: a call due
+// during it would start late, and one the player has already started holds the bus. The
+// emulator keeps the player fed while the transfer waits for its gap.
 static FLASHMEM bool C64Dma(DMA_Trans_RnW rnw, uint16_t addr, uint8_t *buf, uint32_t len, DMA_Addr_Mode mode)
 {
-   return PerformDMA(rnw, addr, buf, len, mode) && CloseDMA();
+   uint32_t began = millis();
+   while (SidPlayer::busySoon(DmaGuarduS * (F_CPU_ACTUAL / 1000000)) && millis() - began < DmaGuardWaitmS)
+      if (Playing) ServicePlayback();
+   SidPlayer::ThreadDma = true;
+   began = millis();
+   while (SidPlayer::Holding || DMA_State != DMA_S_DisableReady)
+      if (millis() - began >= DmaIdleWaitmS) { SidPlayer::ThreadDma = false; return false; }
+   const bool ok = PerformDMA(rnw, addr, buf, len, mode) && CloseDMA();
+   SidPlayer::ThreadDma = false;
+   return ok;
 }
 
 // Bits 8-15: CIA1's control register A, 0 after a reset and running once the KERNAL's IOINIT
@@ -135,6 +168,7 @@ static FLASHMEM uint8_t ScreenCode(char c)
    if (c >= 'a' && c <= 'z') return c - 'a' + 1;
    if (c >= '@' && c <= ']') return c - '@';
    if (c >= ' ' && c <= '?') return c;
+   if (c == '_') return 0x64;   // no underscore in the character set; the low line graphic is closest
    return '?';
 }
 
@@ -147,30 +181,6 @@ static FLASHMEM bool PutRow(uint8_t row, const char *text, uint8_t color)
    if (!C64Dma(DMA_WRITE, 0x0400 + row * 40, cells, 40, DMA_ADDR_INCREMENT)) return false;
    memset(cells, color, 40);
    return C64Dma(DMA_WRITE, 0xD800 + row * 40, cells, 40, DMA_ADDR_INCREMENT);
-}
-
-// Voice 1, triangle at 440 Hz for the machine's clock, full sustain; gated on
-// after the rest is in place so the envelope starts from the values written.
-static FLASHMEM void ToneOn()
-{
-   const uint16_t freq = (TimingVidTODClks & rvtcNTSC) ? 0x1C32 : 0x1D44;
-   uint8_t regs[25]{};
-   regs[0x00] = freq & 0xFF; regs[0x01] = freq >> 8;
-   regs[0x04] = 0x10;   // triangle, gate off
-   regs[0x05] = 0x00;   // attack 2 mS, decay 6 mS
-   regs[0x06] = 0xF0;   // sustain full, release 6 mS
-   regs[0x18] = 0x0F;   // volume
-   C64Dma(DMA_WRITE, 0xD400, regs, sizeof regs, DMA_ADDR_INCREMENT);
-   uint8_t gate = 0x11;
-   C64Dma(DMA_WRITE, 0xD404, &gate, 1, DMA_ADDR_FIXED);
-   ToneOffmS = millis() + ToneOnmS;
-}
-
-static FLASHMEM void ToneOff()
-{
-   uint8_t gate = 0x10;
-   C64Dma(DMA_WRITE, 0xD404, &gate, 1, DMA_ADDR_FIXED);
-   ToneOffmS = 0;
 }
 
 // ------------------------------------------------------------- the tune
@@ -242,11 +252,95 @@ static FLASHMEM void BenchEmulator(char *line, size_t cap, char *line2, size_t c
    snprintf(line2, cap2, "No PHI2 int: avg %lu max %lu init %lu", (unsigned long)avg, (unsigned long)worst, (unsigned long)init);
 }
 
+// ------------------------------------------------------------- playback
+
+static FLASHMEM SidMachineMem EmuMem()
+{
+   return SidMachineMem{(uint8_t *)EmuRamAddr, (uint8_t *)EmuKernAddr, (uint8_t *)EmuBasicAddr, (uint8_t *)EmuColorAddr};
+}
+
+static FLASHMEM SidFrame EmptySlot(uint8_t n)
+{
+   return SidFrame{(SidCall *)SlotCallsAddr + n * SlotCallsMax, (BusWrite *)SlotWritesAddr + n * SlotWritesMax,
+                   SlotCallsMax, SlotWritesMax, 0, 0, 0, 0, false};
+}
+
+// Hands a frame to the player with the time it is due. A frame due in the past means the
+// emulator fell behind: the clock starts again from now, a tempo glitch instead of a burst
+// of calls played back to back.
+static FLASHMEM void QueueFrame(const SidFrame *f)
+{
+   uint32_t base = (uint32_t)(NextBaseQ16 >> 16);
+   if ((int32_t)(base - ARM_DWT_CYCCNT) < 0)
+   {
+      Underruns++;
+      base = ARM_DWT_CYCCNT + SidPlayer::LeadArm * 2;
+      NextBaseQ16 = (uint64_t)base << 16;
+   }
+   SidPlayer::queue(f, base);
+   NextBaseQ16 += (uint64_t)Machine.cyclesPerFrame() * SidPlayer::ArmPerCycleQ16;
+}
+
+static FLASHMEM const SidFrame *EmulateFrame()
+{
+   const uint32_t t = ARM_DWT_CYCCNT;
+   const SidFrame *f = Frames.produce(Machine);
+   const uint32_t spent = ARM_DWT_CYCCNT - t;
+   EmuFrames++;
+   EmuTotalArm += spent;
+   if (spent > EmuMaxArm) EmuMaxArm = spent;
+   if (f->overflow) Overflows++;
+   return f;
+}
+
+static FLASHMEM bool StartPlayback(uint8_t song0)
+{
+   Machine.init(EmuMem(), Tune.clock == 2);
+   if (!Machine.load(Tune)) return false;
+   Machine.start(song0);
+   Frames.init(EmptySlot(0), EmptySlot(1), (SidWrite *)WritesAddr, WritesMax);
+   FramesReleased = Underruns = Overflows = 0;
+   EmuFrames = EmuTotalArm = EmuMaxArm = 0;
+   SidPlayer::begin(Machine.ntsc() ? NtscClockHz : PalClockHz);
+   const SidFrame *first = EmulateFrame(), *second = EmulateFrame();
+   NextBaseQ16 = (uint64_t)(ARM_DWT_CYCCNT + StartLeadmS * (F_CPU_ACTUAL / 1000)) << 16;
+   QueueFrame(first);
+   QueueFrame(second);
+   Playing = true;
+   return true;
+}
+
+// Frees the slots the player is done with and fills them: the emulator stays one frame ahead.
+static FLASHMEM void ServicePlayback()
+{
+   for (const uint32_t done = SidPlayer::FramesDone; FramesReleased != done; FramesReleased++) Frames.release();
+   if (Frames.ready() < 2) QueueFrame(EmulateFrame());
+}
+
+static FLASHMEM void ShowPlayStats()
+{
+   char line[48];
+   const uint32_t perCycle = SidPlayer::ArmPerCycleQ16 >> 16, perUs = F_CPU_ACTUAL / 1000000;
+   const int32_t slack = SidPlayer::MinSlackArm;
+   snprintf(line, sizeof line, "Frames %lu calls %lu late %lu lead %ld",
+            (unsigned long)SidPlayer::FramesDone, (unsigned long)SidPlayer::Calls, (unsigned long)SidPlayer::LateCalls,
+            (long)(slack == INT32_MAX ? 0 : slack / (int32_t)perCycle));
+   PutRow(14, line, 7);
+   snprintf(line, sizeof line, "Emu uS avg %lu max %lu  underruns %lu",
+            (unsigned long)(EmuFrames ? (uint32_t)(EmuTotalArm / EmuFrames) / perUs : 0), (unsigned long)(EmuMaxArm / perUs),
+            (unsigned long)Underruns);
+   PutRow(15, line, 7);
+   snprintf(line, sizeof line, "Writes %lu BA wait cycles %lu", (unsigned long)SidPlayer::Writes, (unsigned long)SidPlayer::BaWaits);
+   PutRow(16, line, 7);
+   snprintf(line, sizeof line, "Frames that dropped writes %lu", (unsigned long)Overflows);
+   PutRow(17, line, Overflows ? 10 : 7);
+}
+
 static FLASHMEM void DrawScreen()
 {
    char line[48], line2[48];
    for (uint8_t row = 0; row < 25; row++) PutRow(row, "", 1);
-   PutRow(0, "SIDHost - phase 1 skeleton", 7);
+   PutRow(0, "SIDHost", 7);
    const char *name = strrchr(TunePath, '/');
    PutRow(2, name ? name + 1 : "(no file)", 15);   // PutRow keeps the first 40 characters
    if (TuneLoaded)
@@ -266,7 +360,7 @@ static FLASHMEM void DrawScreen()
    snprintf(line, sizeof line, "Machine: %s %s", (TimingVidTODClks & rvtcC128) ? "C128" : "C64",
             (TimingVidTODClks & rvtcNTSC) ? "NTSC" : "PAL");
    PutRow(10, line, 12);
-   PutRow(23, "T: test tone   X: back to the menu", 15);
+   PutRow(23, "X: back to the menu", 15);
 }
 
 static FLASHMEM void ShowKey(const uint8_t *mb)
@@ -355,8 +449,9 @@ void loop()
       return;
    }
 
+   if (Playing) ServicePlayback();
    const uint32_t now = millis();
-   if (ToneOffmS && (int32_t)(now - ToneOffmS) >= 0) ToneOff();
+   if (Playing && now - LastStatsmS >= StatsmS) { LastStatsmS = now; ShowPlayStats(); }
    if (now - ResetReleasedmS < StubWaitmS || now - LastPollmS < (StubReady ? PollmS : 100)) return;
    LastPollmS = now;
 
@@ -378,7 +473,7 @@ void loop()
       StubReady = true;
       LastSeq = mb[MbSeq];
       DrawScreen();
-      ToneOn();
+      if (TuneLoaded && !StartPlayback((uint8_t)(Tune.startSong - 1))) PutRow(14, "No free page for the driver", 10);
       return;
    }
 
@@ -386,7 +481,6 @@ void loop()
    LastSeq = mb[MbSeq];
    ShowKey(mb);
    if (mb[MbKey] == 'X') ReturnToMenu(ExitKey);
-   if (mb[MbKey] == 'T') ToneOn();
 }
 
 // The shared minimal sources call these; same bodies as MinimalBoot.ino.
