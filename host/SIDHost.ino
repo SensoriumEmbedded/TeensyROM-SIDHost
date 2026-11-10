@@ -398,7 +398,7 @@ static FLASHMEM void ShowPlayStats()
    PutRow(15, line, 7);
    snprintf(line, sizeof line, "Writes %lu BA wait cycles %lu", (unsigned long)SidPlayer::Writes, (unsigned long)SidPlayer::BaWaits);
    PutRow(16, line, 7);
-   snprintf(line, sizeof line, "Frames that dropped writes %lu", (unsigned long)Overflows);
+   snprintf(line, sizeof line, "Chained %lu  frames dropping writes %lu", (unsigned long)SidPlayer::Chained, (unsigned long)Overflows);
    PutRow(17, line, Overflows ? 10 : 7);
 }
 
