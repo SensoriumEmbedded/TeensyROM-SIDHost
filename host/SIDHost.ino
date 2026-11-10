@@ -106,7 +106,8 @@ static char Status[41];           // why there is no tune, when there is none
 static char TunePath[sizeof(VmLaunchRecord::content)];
 
 static SidFramePair Frames;
-static bool Playing;
+static bool Playing, Paused;
+static uint8_t CurrentSong;       // 0-based
 static uint32_t FramesReleased, Underruns, Overflows;
 static uint64_t NextBaseQ16;      // ARM cycle at which the next queued frame's cycle 0 is due, 16.16
 static uint32_t EmuFrames, EmuMaxArm;
@@ -142,12 +143,13 @@ static FLASHMEM bool C64Dma(DMA_Trans_RnW rnw, uint16_t addr, uint8_t *buf, uint
    uint32_t began = millis();
    while (SidPlayer::busySoon(DmaGuarduS * (F_CPU_ACTUAL / 1000000)) && millis() - began < DmaGuardWaitmS)
       if (Playing) ServicePlayback();
-   SidPlayer::ThreadDma = true;
+   const bool heldOff = SidPlayer::HoldOff;   // a pause keeps the player held off after this
+   SidPlayer::HoldOff = true;
    began = millis();
    while (SidPlayer::Holding || DMA_State != DMA_S_DisableReady)
-      if (millis() - began >= DmaIdleWaitmS) { SidPlayer::ThreadDma = false; return false; }
+      if (millis() - began >= DmaIdleWaitmS) { SidPlayer::HoldOff = heldOff; return false; }
    const bool ok = PerformDMA(rnw, addr, buf, len, mode) && CloseDMA();
-   SidPlayer::ThreadDma = false;
+   SidPlayer::HoldOff = heldOff;
    return ok;
 }
 
@@ -293,15 +295,25 @@ static FLASHMEM const SidFrame *EmulateFrame()
    return f;
 }
 
+static FLASHMEM void ShowSong()
+{
+   char line[41];
+   snprintf(line, sizeof line, "Song %u of %u, %s timed%s", CurrentSong + 1, Tune.songs,
+            sidSpeedIsCia(Tune, CurrentSong) ? "CIA" : "raster", Paused ? "  - paused" : "");
+   PutRow(19, line, Paused ? 10 : 1);
+}
+
 static FLASHMEM bool StartPlayback(uint8_t song0)
 {
+   CurrentSong = song0;
+   Paused = false;
    Machine.init(EmuMem(), Tune.clock == 2);
    if (!Machine.load(Tune)) return false;
    Machine.start(song0);
    Frames.init(EmptySlot(0), EmptySlot(1), (SidWrite *)WritesAddr, WritesMax);
    FramesReleased = Underruns = Overflows = 0;
    EmuFrames = EmuTotalArm = EmuMaxArm = 0;
-   SidPlayer::begin(Machine.ntsc() ? NtscClockHz : PalClockHz);
+   SidPlayer::begin(Machine.ntsc() ? NtscClockHz : PalClockHz, sidExtraAddr(Tune.sid2Addr), sidExtraAddr(Tune.sid3Addr));
    const SidFrame *first = EmulateFrame(), *second = EmulateFrame();
    NextBaseQ16 = (uint64_t)(ARM_DWT_CYCCNT + StartLeadmS * (F_CPU_ACTUAL / 1000)) << 16;
    QueueFrame(first);
@@ -310,9 +322,63 @@ static FLASHMEM bool StartPlayback(uint8_t song0)
    return true;
 }
 
+// The player out and the chip silent, as a reset leaves it, before another song starts.
+static FLASHMEM void StopPlayback()
+{
+   if (!Playing) return;
+   SidPlayer::end();
+   Playing = Paused = false;
+   uint8_t regs[25]{};
+   C64Dma(DMA_WRITE, 0xD400, regs, sizeof regs, DMA_ADDR_INCREMENT);
+}
+
+static FLASHMEM void ChangeSong(int step)
+{
+   if (!TuneLoaded || Tune.songs < 2) return;
+   StopPlayback();
+   if (!StartPlayback((uint8_t)((CurrentSong + Tune.songs + step) % Tune.songs))) PutRow(14, "No free page for the driver", 10);
+   ShowSong();
+}
+
+// Each chip the tune writes gets its last volume register back, or with mute that register's
+// filter mode bits and a volume of 0.
+static FLASHMEM void SetVolumes(bool mute)
+{
+   for (uint8_t chip = 0; chip < 3; chip++)
+   {
+      if (!SidPlayer::ChipBase[chip]) continue;
+      uint8_t volume = SidPlayer::LastVolume[chip] & (mute ? 0xF0 : 0xFF);
+      C64Dma(DMA_WRITE, SidPlayer::ChipBase[chip] + 0x18, &volume, 1, DMA_ADDR_FIXED);
+   }
+}
+
+// A pause stops the calls and turns the volume down, as a player on the C64 would; the queued
+// frames wait, and resume moves them to now so the tune carries on where it stopped.
+static FLASHMEM void TogglePause()
+{
+   if (!Playing) return;
+   if (!Paused)
+   {
+      SidPlayer::holdOff(DmaIdleWaitmS);
+      Paused = true;
+      SetVolumes(true);
+   }
+   else
+   {
+      SetVolumes(false);
+      const uint32_t lead = StartLeadmS * (F_CPU_ACTUAL / 1000);
+      const uint32_t moved = SidPlayer::resume(lead);
+      if (SidPlayer::HaveNext) NextBaseQ16 += (uint64_t)moved << 16;
+      else NextBaseQ16 = (uint64_t)(ARM_DWT_CYCCNT + lead) << 16;
+      Paused = false;
+   }
+   ShowSong();
+}
+
 // Frees the slots the player is done with and fills them: the emulator stays one frame ahead.
 static FLASHMEM void ServicePlayback()
 {
+   if (Paused) return;
    for (const uint32_t done = SidPlayer::FramesDone; FramesReleased != done; FramesReleased++) Frames.release();
    if (Frames.ready() < 2) QueueFrame(EmulateFrame());
 }
@@ -348,9 +414,9 @@ static FLASHMEM void DrawScreen()
       PutRow(3, Tune.name, 1);
       PutRow(4, Tune.author, 1);
       PutRow(5, Tune.released, 1);
-      snprintf(line, sizeof line, "%s v%u $%04X-$%04X song %u/%u %s",
-               Tune.rsid ? "RSID" : "PSID", Tune.version, Tune.loadAddr, Tune.loadEnd, Tune.startSong, Tune.songs,
-               Tune.clock == 2 ? "NTSC" : "PAL");
+      snprintf(line, sizeof line, "%s v%u $%04X-$%04X %s, start song %u",
+               Tune.rsid ? "RSID" : "PSID", Tune.version, Tune.loadAddr, Tune.loadEnd,
+               Tune.clock == 2 ? "NTSC" : "PAL", Tune.startSong);
       PutRow(6, line, 12);
       BenchEmulator(line, sizeof line, line2, sizeof line2);
       PutRow(8, line, 13);
@@ -360,7 +426,7 @@ static FLASHMEM void DrawScreen()
    snprintf(line, sizeof line, "Machine: %s %s", (TimingVidTODClks & rvtcC128) ? "C128" : "C64",
             (TimingVidTODClks & rvtcNTSC) ? "NTSC" : "PAL");
    PutRow(10, line, 12);
-   PutRow(23, "X: back to the menu", 15);
+   PutRow(23, "+/-: song  Space: pause  X: menu", 15);
 }
 
 static FLASHMEM void ShowKey(const uint8_t *mb)
@@ -473,14 +539,24 @@ void loop()
       StubReady = true;
       LastSeq = mb[MbSeq];
       DrawScreen();
-      if (TuneLoaded && !StartPlayback((uint8_t)(Tune.startSong - 1))) PutRow(14, "No free page for the driver", 10);
+      if (TuneLoaded)
+      {
+         if (StartPlayback((uint8_t)(Tune.startSong - 1))) ShowSong();
+         else PutRow(14, "No free page for the driver", 10);
+      }
       return;
    }
 
    if (mb[MbSeq] == LastSeq) return;
    LastSeq = mb[MbSeq];
    ShowKey(mb);
-   if (mb[MbKey] == 'X') ReturnToMenu(ExitKey);
+   switch (mb[MbKey])   // PETSCII, as GETIN returns it
+   {
+      case 'X': ReturnToMenu(ExitKey); break;
+      case '+': ChangeSong(1); break;
+      case '-': ChangeSong(-1); break;
+      case ' ': TogglePause(); break;
+   }
 }
 
 // The shared minimal sources call these; same bodies as MinimalBoot.ino.

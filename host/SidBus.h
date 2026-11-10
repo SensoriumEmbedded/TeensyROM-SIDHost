@@ -30,7 +30,12 @@ namespace SidPlayer
    static uint32_t ArmPerCycleQ16;          // ARM cycles per emulated cycle, 16.16
    static uint32_t LeadArm;
    static volatile bool Holding;            // the snoop asked for the hold the bus is in or going into
-   static volatile bool ThreadDma;          // a thread-mode transfer owns the bus: ask for no hold
+   static volatile bool HoldOff;            // ask for no hold: a thread-mode transfer, a pause or a stop
+   // The chips the tune writes: SID 1 at $D400 (and its mirrors up to $D7FF), and the header's second
+   // and third, 0 when absent. LastVolume is each one's $18 register as last written, which a pause
+   // turns down and resume puts back.
+   static uint16_t ChipBase[3];
+   static volatile uint8_t LastVolume[3];
 
    static volatile uint32_t FramesDone, Calls, Writes, LateCalls;
    static volatile uint32_t BaWaits;        // cycles writes waited for BA: up to ~40 for each badline a call runs into
@@ -69,7 +74,7 @@ namespace SidPlayer
       const uint32_t due = NextDue;
       if (!Holding)
       {
-         if (ThreadDma || DMA_State != DMA_S_DisableReady || (int32_t)(ARM_DWT_CYCCNT + LeadArm - due) < 0) return false;
+         if (HoldOff || DMA_State != DMA_S_DisableReady || (int32_t)(ARM_DWT_CYCCNT + LeadArm - due) < 0) return false;
          DMA_State = DMA_S_StartAsynch;   // this interrupt's tail and the next ones assert /DMA
          Holding = true;
          return false;
@@ -97,7 +102,17 @@ namespace SidPlayer
             {
                uint8_t value = w[next].value;
                DMA_StartAddr = w[next].addr;
-               if (DMAByte(&value)) next++;
+               if (DMAByte(&value))
+               {
+                  const uint16_t a = DMA_StartAddr;
+                  if ((a & 0x1F) == 0x18)
+                  {
+                     if (ChipBase[1] && (a & 0xFFE0) == ChipBase[1]) LastVolume[1] = value;
+                     else if (ChipBase[2] && (a & 0xFFE0) == ChipBase[2]) LastVolume[2] = value;
+                     else if ((a & 0xFC00) == 0xD400) LastVolume[0] = value;   // $D418 or a mirror of it
+                  }
+                  next++;
+               }
                else slip++;
             }
             cycle++;
@@ -117,25 +132,59 @@ namespace SidPlayer
    }
 
    // clockHz: the emulated machine's clock, so a tune plays at its own rate on either machine.
-   static FLASHMEM void begin(uint32_t clockHz)
+   // sid2, sid3: the header's extra chips (sidExtraAddr), 0 when absent.
+   static FLASHMEM void begin(uint32_t clockHz, uint16_t sid2, uint16_t sid3)
    {
+      ChipBase[0] = 0xD400; ChipBase[1] = sid2; ChipBase[2] = sid3;
+      LastVolume[0] = LastVolume[1] = LastVolume[2] = 0;
       ArmPerCycleQ16 = (uint32_t)(((uint64_t)F_CPU_ACTUAL << 16) / clockHz);
       LeadArm = (uint32_t)(((uint64_t)LeadCycles * ArmPerCycleQ16) >> 16);
       Head = Count = 0;
       NextCall = 0;
-      HaveNext = Holding = ThreadDma = false;
+      HaveNext = Holding = HoldOff = false;
       FramesDone = Calls = Writes = BaWaits = LateCalls = 0;
       MinSlackArm = INT32_MAX;
       fBusSnoop = snoop;
       asm volatile("" ::: "memory");   // fBusSnoop is not volatile: keep the store
    }
 
+   // Asks for no more holds and waits for a call that already has one to finish; false if it
+   // does not within waitmS. Stays held off until resume or begin.
+   static FLASHMEM bool holdOff(uint32_t waitmS)
+   {
+      HoldOff = true;
+      const uint32_t began = millis();
+      while (Holding)
+         if (millis() - began >= waitmS) return false;
+      return true;
+   }
+
+   // Takes the snoop out once no call holds the bus, so no hold is left asserted.
    static FLASHMEM void end()
    {
+      holdOff(100);
       HaveNext = false;
       Count = 0;
       fBusSnoop = nullptr;
       asm volatile("" ::: "memory");   // fBusSnoop is not volatile: keep both stores
+   }
+
+   // Ends a holdOff with the queued calls moved later, so the next one is due leadArm from now
+   // and the rest keep their spacing. Returns how far they moved (mod 2^32, as every time here
+   // is), for the caller's own clock; 0 with an empty ring.
+   static FLASHMEM uint32_t resume(uint32_t leadArm)
+   {
+      __disable_irq();
+      uint32_t moved = 0;
+      if (HaveNext)
+      {
+         moved = ARM_DWT_CYCCNT + leadArm - NextDue;
+         NextDue = NextDue + moved;
+         for (uint8_t i = 0; i < Count; i++) Ring[(Head + i) & 1].base += moved;
+      }
+      HoldOff = false;
+      __enable_irq();
+      return moved;
    }
 
    // False when the ring is full.
@@ -153,11 +202,12 @@ namespace SidPlayer
       return room;
    }
 
-   // Whether the next queued call is due within arm cycles of now, or a hold is in progress.
+   // Whether a hold is in progress, or the next queued call is due within arm cycles of now and
+   // the player is not held off (a paused player's next call is overdue, and waits anyway).
    static FLASHMEM bool busySoon(uint32_t arm)
    {
       __disable_irq();
-      const bool soon = Holding || (HaveNext && (int32_t)(NextDue - ARM_DWT_CYCCNT) < (int32_t)arm);
+      const bool soon = Holding || (!HoldOff && HaveNext && (int32_t)(NextDue - ARM_DWT_CYCCNT) < (int32_t)arm);
       __enable_irq();
       return soon;
    }
