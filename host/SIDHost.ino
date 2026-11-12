@@ -14,7 +14,7 @@
 //   python3 tools/bench/hostinstall.py build/firmware/TeensyROM+_<ver>_SIDHost.TRH
 //
 // Keys on the C64: X returns to the menu (so does the menu button, or resetting
-// the C64).
+// the C64). C captures the song as the real 6510 plays it (tools/sidhost/README.md).
 
 #include <SD.h>
 #include <EEPROM.h>
@@ -42,6 +42,7 @@ Stream *CmdChannel = &Serial;
 #include "Common/VMRegistry.h"
 #include "SidMachine.h"
 #include "SidBus.h"
+#include "SidCapBus.h"
 #include "SIDHostStub.bin.h"
 
 extern "C" uint32_t set_arm_clock(uint32_t frequency);
@@ -83,6 +84,15 @@ enum : uint32_t {
 };
 static_assert((uint32_t)Ram2End <= (uint32_t)VM_FAIL_BASE, "emulator buffers overlap the fail record");
 
+// A capture's log takes everything above the .sid file: playback is stopped while it runs.
+enum : uint32_t { CaptureAddr = WritesAddr, CaptureMax = ((uint32_t)VM_FAIL_BASE - CaptureAddr) / sizeof(SidCapRecord) };
+
+enum : uint32_t {
+   CaptureSeconds = 60,
+   StubLoopAddr   = 0x0341,   // the stub's main loop, which starts with JSR GETIN ($20 $E4 $FF)
+   CapturePad     = 0xE4,     // the driver page offset that jumps on to the prologue: GETIN's low byte
+};
+
 enum : uint32_t {
    StubWaitmS      = 500,    // after reset release: no DMA in a C128's first ~80 mS, and the KERNAL init runs
    StubTimeoutmS   = 5000,   // a stub that has not said ready by then never will
@@ -115,6 +125,7 @@ static uint64_t EmuTotalArm;
 
 static uint32_t ResetReleasedmS, LastPollmS, LastStatsmS;
 static bool StubReady;
+static char CaptureNote[41];      // what the last capture did, shown once the stub is back
 static uint8_t LastSeq, DmaFails;
 
 // ------------------------------------------------------------- the way back
@@ -208,6 +219,7 @@ static FLASHMEM void LoadTune()
    if (!sidParse(file, size, Tune)) { strcpy(Status, "Header rejected"); return; }
    if (Tune.basic) { strcpy(Status, "C64 BASIC tune: not yet"); return; }
    TuneLoaded = true;
+   CurrentSong = (uint8_t)(Tune.startSong - 1);
 }
 
 // The tune's first BenchFrames frames from a fresh start, in microseconds: the average, the
@@ -402,6 +414,92 @@ static FLASHMEM void ShowPlayStats()
    PutRow(17, line, Overflows ? 10 : 7);
 }
 
+// ------------------------------------------------------------- capture
+
+// The file beside the tune: <name>.s<song>.<pal|ntsc>.cap, or .on.cap with the screen on, so
+// the two captures of one song do not replace each other. A failed write leaves no file.
+static FLASHMEM bool SaveCapture(const SidCapHeader &head, char *path, size_t cap)
+{
+   const char *slash = strrchr(TunePath, '/'), *dot = strrchr(TunePath, '.');
+   const int stem = (int)(dot && (!slash || dot > slash) ? dot - TunePath : strlen(TunePath));
+   snprintf(path, cap, "%.*s.s%u.%s%s.cap", stem, TunePath, head.song + 1u, (head.flags & SidCapNtsc) ? "ntsc" : "pal",
+            (head.flags & SidCapScreenOn) ? ".on" : "");
+   FsFile f = SD.sdfs.open(path, O_WRONLY | O_CREAT | O_TRUNC);
+   if (!f) return false;
+   const uint32_t bytes = head.count * sizeof(SidCapRecord);
+   const bool ok = f.write(&head, sizeof head) == sizeof head && f.write((const uint8_t *)CaptureAddr, bytes) == bytes;
+   const bool closed = f.close();
+   if (ok && closed) return true;
+   SD.sdfs.remove(path);
+   return false;
+}
+
+// The current song played by the real 6510, with every SID write logged from the bus
+// (SidCapBus.h): the comparison with the emulator is the harness's --compare. The C64
+// gets the RAM image startNative builds, the same driver the emulator runs, while the
+// stub keeps running; the vectors are the prologue's to set. The last write puts
+// JMP page+$E4 over the stub's JSR GETIN: a halt inside that JSR leaves its low operand
+// $E4 either way, and the high byte is fetched last, so the stub lands on the pad. Then
+// the screen goes off (unless screenOn), the capture runs, and a reset brings the stub back.
+static FLASHMEM void Capture(bool screenOn)
+{
+   if (!TuneLoaded) return;
+   const uint8_t song = CurrentSong;
+   if (Tune.loadAddr < 0x0400 || (Tune.loadAddr <= 0xDFFF && Tune.loadEnd >= 0xD000))
+   {
+      PutRow(21, "Capture: tune loads below $0400 or in I/O", 10);
+      return;
+   }
+   StopPlayback();
+   const bool ntsc = TimingVidTODClks & rvtcNTSC;
+   Machine.init(EmuMem(), ntsc);
+   if (!Machine.load(Tune)) { PutRow(21, "Capture: no free page for the driver", 10); StartPlayback(song); return; }
+   const uint16_t prologue = Machine.startNative(song, !screenOn);
+   uint8_t *ram = (uint8_t *)EmuRamAddr;
+   const uint16_t page = (uint16_t)(Machine.driverPage() << 8);
+   ram[page + CapturePad] = 0x4C;
+   ram[page + CapturePad + 1] = (uint8_t)prologue;
+   ram[page + CapturePad + 2] = (uint8_t)(prologue >> 8);
+   uint8_t jump[3] = {0x4C, CapturePad, (uint8_t)(page >> 8)};
+
+   SetExROMDeassert;   // a tune at $8000-$9FFF reads its own bytes; the stub runs from RAM
+   const bool sent = C64Dma(DMA_WRITE, page, ram + page, 256, DMA_ADDR_INCREMENT) &&
+                     C64Dma(DMA_WRITE, Tune.loadAddr, ram + Tune.loadAddr, Tune.loadEnd - Tune.loadAddr + 1u, DMA_ADDR_INCREMENT) &&
+                     C64Dma(DMA_WRITE, 0xFFFA, ram + 0xFFFA, 6, DMA_ADDR_INCREMENT) &&
+                     C64Dma(DMA_WRITE, 0x02A6, ram + 0x02A6, 1, DMA_ADDR_INCREMENT) &&
+                     C64Dma(DMA_WRITE, StubLoopAddr, jump, sizeof jump, DMA_ADDR_INCREMENT);
+   if (sent)
+   {
+      SidCapBus::begin((SidCapRecord *)CaptureAddr, CaptureMax, sidExtraAddr(Tune.sid2Addr), sidExtraAddr(Tune.sid3Addr));
+      const uint32_t limit = CaptureSeconds * (ntsc ? NtscClockHz : PalClockHz);
+      while (SidCapBus::Count < CaptureMax && SidCapBus::Cycle < limit)
+         if (BtnPressed) { SidCapBus::end(); ReturnToMenu(ExitButton); }
+      SidCapBus::end();
+
+      SidCapHeader head{};
+      memcpy(head.magic, SidCapMagic, sizeof head.magic);
+      head.version = SidCapVersion;
+      head.flags = (uint8_t)((ntsc ? SidCapNtsc : 0) | (screenOn ? SidCapScreenOn : 0));
+      head.song = song;
+      head.count = SidCapBus::Count;
+      head.cycles = SidCapBus::Cycle;
+      char path[sizeof TunePath + 24];
+      if (SaveCapture(head, path, sizeof path))
+      {
+         const char *name = strrchr(path, '/');
+         snprintf(CaptureNote, sizeof CaptureNote, "%lu writes: %s", (unsigned long)head.count, name ? name + 1 : path);
+      }
+      else snprintf(CaptureNote, sizeof CaptureNote, "Capture not saved: SD write failed");
+   }
+   else snprintf(CaptureNote, sizeof CaptureNote, "Capture failed: DMA did not complete");
+
+   // The stub back as a cold start leaves it: the cartridge, a reset, the screen redrawn.
+   SetExROMAssert;
+   StubReady = false;
+   CurrentSong = song;
+   doReset = true;
+}
+
 static FLASHMEM void DrawScreen()
 {
    char line[48], line2[48];
@@ -539,9 +637,10 @@ void loop()
       StubReady = true;
       LastSeq = mb[MbSeq];
       DrawScreen();
+      if (CaptureNote[0]) PutRow(21, CaptureNote, 13);
       if (TuneLoaded)
       {
-         if (StartPlayback((uint8_t)(Tune.startSong - 1))) ShowSong();
+         if (StartPlayback(CurrentSong)) ShowSong();   // the start song, or the one a capture played
          else PutRow(14, "No free page for the driver", 10);
       }
       return;
@@ -556,6 +655,8 @@ void loop()
       case '+': ChangeSong(1); break;
       case '-': ChangeSong(-1); break;
       case ' ': TogglePause(); break;
+      case 'C': Capture(false); break;
+      case 0xC3: Capture(true); break;   // Shift+C: the screen stays on, badlines and all
    }
 }
 

@@ -70,3 +70,52 @@ differ; `--harness-arg <flag>` passes an option through to the harness (for
 instance `--harness-arg --ntsc`).
 
 `HVSC_DIR` stands in for `--hvsc`. The collection itself stays out of the repo.
+
+## Capturing a real C64
+
+Comparing audio with a native run cannot show the order of a tune's register
+writes inside a play call. The host's capture mode can: on the SIDHost screen,
+**C** plays the current song on the real 6510 and logs every SID write with its
+bus cycle; **Shift+C** does the same with the screen left on.
+
+The C64 gets the same RAM image the emulator runs (the tune, the driver page and
+its vectors), and a short prologue in the driver page waits for the bottom border
+and sets the CIAs and the VIC up as the emulator does. With the screen off the VIC takes no badlines, so the
+spacing of the writes can match the emulator's cycle for cycle; with it on, every
+write the VIC delays shows how far. The capture runs for 60 seconds or until its
+buffer is full (46,940 writes: a minute of most tunes, 16 seconds of a 4x CIA
+player), writes `<tune>.s<song>.<pal|ntsc>.cap` (`.on.cap` for a screen-on one)
+beside the `.sid` on the SD card, and resets the C64 back to the SIDHost screen,
+which shows the file's name. A tune that loads below `$0400` or under the I/O area
+cannot be captured: the stub and the I/O chips sit there.
+
+Compare it with the emulation on a PC:
+
+```
+./harness some.sid --compare some.s1.pal.cap
+```
+
+The harness emulates the captured song on the captured machine's standard and
+pairs the two logs play call by play call (the driver marks each play call's
+return), then call by call inside each. It reports how many calls match exactly
+(the same writes, in the same order, at the same offsets from the call's first),
+how many differ in their writes, how many only in their offsets (with a
+histogram), how often a call inside a play call starts at another offset, and the
+play period on both sides, and prints the first ten differences with both sides.
+
+Differences that are not defects: a tune that reads OSC3 or ENV3 (the emulator
+answers fixed values); a tune that times itself off the raster or a CIA timer,
+which the prologue starts at raster line $FA on both sides but only to within its
+wait loop's 9 cycles; a tune that reads
+memory before writing it (the KERNAL's leftovers on the C64, zeros in the
+emulator); a tune that reads chip state the prologue leaves alone, such as CIA 1's
+port directions and timer B or CIA 2's timers (the KERNAL's settings on the C64, a
+reset's in the emulator); a play routine that leaves through `JMP $EA81` (the
+emulator unwinds it, the real KERNAL does not); a tune that writes `$D400-$D7FF`
+or `$DFFF` with the I/O area banked out, which reaches RAM, but the cartridge
+port cannot see the banking, so the capture logs it as a SID write or a play
+marker; a second or third SID at `$DFE0`, whose writes look like the driver's
+marker.
+
+`--write-cap <file>` writes a capture from the emulator itself (with `-n` frames
+and `--blank` for a screen-off one), which is what the tests compare against.
