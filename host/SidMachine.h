@@ -49,6 +49,13 @@ public:
    void init(const SidMachineMem &mem, bool ntsc);
    bool load(const SidHeader &h);     // remembers the tune and picks the driver page; false if no page is free
    void start(uint8_t song0);         // cold start: clears RAM, loads the tune, runs the driver for song0 (0-based)
+   // The same cold start as a real C64 gets it when the host hands it this RAM image
+   // (SIDHost's capture mode): the CIAs and the VIC as a reset leaves them, and the
+   // CPU entering through a prologue in the driver page that sets them up the way
+   // start() does in C++. blank also turns the screen off, so a real VIC takes no
+   // badlines; the emulated one has none either way. Returns the prologue's address.
+   uint16_t startNative(uint8_t song0, bool blank);
+   static constexpr uint8_t NATIVE_START = 0x60;  // the prologue's offset in the driver page: after the driver's 82 bytes at most, 95 bytes long
    void tick();                       // one machine cycle
    void runFrame();                   // one video frame of cycles, the driver's idle loop fast-forwarded
    uint32_t cyclesPerFrame() const { return cyclesPerLine_ * linesPerFrame_; }
@@ -97,6 +104,9 @@ public:
    // event that can end it. Off, every cycle is ticked: the reference the harness compares with.
    bool fastIdle = true;
    uint32_t idleCyclesSkipped() const { return skipped_; }  // since start(): what fastIdle saved
+   // The driver's marker stores go into the write buffer too, as writes to DRIVER_MARKER,
+   // so a trace splits into play calls the way a capture of a real C64 does.
+   bool recordMarker = false;
 
 private:
    static uint8_t portIn(void *user);
@@ -108,6 +118,8 @@ private:
    void ciaWrite(m6526_t &cia, uint8_t reg, uint8_t value);
    void buildRoms();
    void installDriver(uint8_t song0);
+   void begin(uint8_t song0);
+   bool ciaSpeed(uint8_t song0) const;
    static uint8_t bankFor(uint16_t addr);
    void record(uint16_t a, uint8_t v);
    uint32_t idleSpan(uint32_t limit) const;

@@ -223,6 +223,84 @@ test('a second SID at $DFE0 does not take the driver marker for one of its write
   assert.ok(!/ DFFF /.test(trace), 'the marker store is not a recorded write');
 });
 
+test('the native start, the prologue a real C64 runs in a capture, gives the same calls as the emulated setup', { skip }, () => {
+  harness();
+  const file = makePsid();
+  for (const song of ['0', '1']) {
+    const writes = (extra) => spawnSync(harness(), [file, '-a', song, '-n', '50', '--calls', ...extra], { encoding: 'utf8' }).stdout
+      .split(/\r?\n/).filter((l) => l.startsWith('W '));
+    const plain = writes([]);
+    assert.ok(plain.length > 50, `song ${song}`);
+    // The prologue waits for raster line $FA, so a CIA song's timer starts that much
+    // later and the native run can end a call or two short; up to there they agree.
+    for (const extra of [['--native'], ['--native', '--blank']]) {
+      const native = writes(extra);
+      assert.ok(native.length >= plain.length - 4, `song ${song} ${extra}: ${native.length} of ${plain.length} writes`);
+      assert.deepEqual(native, plain.slice(0, native.length), `song ${song} ${extra}`);
+    }
+  }
+});
+
+// A capture file: 32-byte header (magic, version, flags, song, count, cycles), then
+// 8-byte records (cycle, address, value, pad), little-endian.
+function compare(sid, cap) {
+  const out = spawnSync(harness(), [sid, '--compare', cap], { encoding: 'utf8' }).stdout;
+  const m = /^# compare: play calls (\d+) calls (\d+) exact (\d+) writes-differ (\d+) offsets-differ (\d+) call-count-differs (\d+)$/m.exec(out);
+  assert.ok(m, out);
+  const [playCalls, calls, exact, writes, offsets, shape] = m.slice(1).map(Number);
+  return { playCalls, calls, exact, writes, offsets, shape, out };
+}
+
+test('a capture compares play call by play call, and a changed value, order or offset is reported', { skip }, () => {
+  harness();
+  const sid = makePsid();
+  for (const song of ['0', '1']) {
+    const cap = path.join(dir, `c${song}.cap`);
+    const wrote = spawnSync(harness(), [sid, '-a', song, '-n', '100', '--blank', '--write-cap', cap], { encoding: 'utf8' });
+    assert.equal(wrote.status, 0, wrote.stderr);
+    const bytes = fs.readFileSync(cap);
+    assert.equal(bytes.toString('latin1', 0, 7), 'SIDCAP1');
+    assert.equal(bytes[11], Number(song));
+    assert.equal(bytes[10], 0, 'PAL, screen off');
+    const records = (bytes.length - 32) / 8;
+    assert.equal(bytes.readUInt32LE(12), records);
+    const rec = (i) => ({ cycle: bytes.readUInt32LE(32 + i * 8), addr: bytes.readUInt16LE(36 + i * 8), value: bytes[38 + i * 8] });
+    assert.ok([...Array(records).keys()].some((i) => rec(i).addr === 0xDFFF), 'the play markers are in the log');
+
+    const clean = compare(sid, cap);
+    assert.ok(clean.playCalls >= 90, clean.out);
+    assert.equal(clean.exact, clean.calls, clean.out);
+    assert.deepEqual([clean.writes, clean.offsets, clean.shape], [0, 0, 0], clean.out);
+    assert.match(clean.out, /largest difference 0 cycles/);
+
+    // The fifth play call's $D400/$D401 pair, 8 cycles apart.
+    const pairs = [...Array(records - 1).keys()].filter((i) => rec(i).addr === 0xD400 && rec(i + 1).addr === 0xD401);
+    const at = pairs[5];
+    const edit = (name, change) => {
+      const copy = Buffer.from(bytes);
+      change(copy);
+      const file = path.join(dir, `c${song}-${name}.cap`);
+      fs.writeFileSync(file, copy);
+      return compare(sid, file);
+    };
+    const value = edit('value', (b) => { b[38 + (at + 1) * 8] ^= 0x40; });
+    assert.deepEqual([value.writes, value.offsets, value.shape], [1, 0, 0], value.out);
+    const order = edit('order', (b) => {
+      b.writeUInt16LE(0xD401, 36 + at * 8); b.writeUInt16LE(0xD400, 36 + (at + 1) * 8);
+      const v = b[38 + at * 8]; b[38 + at * 8] = b[38 + (at + 1) * 8]; b[38 + (at + 1) * 8] = v;
+    });
+    assert.deepEqual([order.writes, order.offsets, order.shape], [1, 0, 0], order.out);
+    const offset = edit('offset', (b) => { b.writeUInt32LE(rec(at + 1).cycle + 1, 32 + (at + 1) * 8); });
+    assert.deepEqual([offset.writes, offset.offsets, offset.shape], [0, 1, 0], offset.out);
+    assert.match(offset.out, /^# offsets differ by: 1 1, /m);
+    assert.match(offset.out, /^! play call \d+, call 0: offsets differ$/m);
+    // $D401 100 cycles late: past the 64-cycle gap, so the captured play call has two calls.
+    const split = edit('split', (b) => { b.writeUInt32LE(rec(at + 1).cycle + 100, 32 + (at + 1) * 8); });
+    assert.deepEqual([split.writes, split.offsets, split.shape], [0, 0, 1], split.out);
+    assert.match(split.out, /^! play call \d+: 2 calls captured, 1 emulated$/m);
+  }
+});
+
 test('headers the format description says to reject are rejected', { skip }, () => {
   harness();
   const rsid = run(makePsid({ magic: 'RSID' }), ['-n', '1']); // RSID with a header load address, play address and speed bits

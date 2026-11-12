@@ -12,6 +12,12 @@
 #define CHIPS_IMPL
 #define CHIPS_ASSERT(c) ((void)0)
 #include "SidMachine.h"
+// On the Teensy, code lands in ITCM unless marked; the cold start runs from flash.
+#if defined(ARDUINO) && defined(__IMXRT1062__)
+#include <Arduino.h>
+#else
+#define FLASHMEM
+#endif
 
 // ------------------------------------------------------------------ setup
 
@@ -159,9 +165,11 @@ void SidMachine::ciaWrite(m6526_t &cia, uint8_t reg, uint8_t value)
    m6526_tick(&cia, p);
 }
 
-void SidMachine::start(uint8_t song0)
+bool SidMachine::ciaSpeed(uint8_t song0) const { return sidSpeedIsCia(tune_, song0) || tune_.rsid; }
+
+// RAM, ROMs, chips at their reset state, and the CPU about to fetch the reset vector.
+FLASHMEM void SidMachine::begin(uint8_t song0)
 {
-   if (!loaded_) return;
    memset(mem_.ram, 0, 0x10000);
    memset(mem_.color, 0, 0x400);
    memcpy(mem_.ram + tune_.loadAddr, tune_.data, tune_.dataLen);
@@ -181,15 +189,30 @@ void SidMachine::start(uint8_t song0)
    playCalls_ = 0;
    skipped_ = 0;
    clearWrites();
+   m6526_init(&cia1_);
+   m6526_init(&cia2_);
+
+   m6502_desc_t desc{};
+   desc.m6510_in_cb = portIn;
+   desc.m6510_out_cb = portOut;
+   desc.m6510_user_data = this;
+   desc.m6510_io_pullup = 0x17;
+   desc.m6510_io_floating = 0xC8;
+   pins_ = m6502_init(&cpu_, &desc);
+   cpuPort_ = 0x37;
+}
+
+FLASHMEM void SidMachine::start(uint8_t song0)
+{
+   if (!loaded_) return;
+   begin(song0);
 
    // The format description's default environment: CIA 1 timer A at 60 Hz and
    // running, its interrupt on for a CIA-speed song and for every RSID; the
    // raster interrupt on only for a VBI PSID, set to line $137 but off for an
-   // RSID; everything else off.
-   const bool cia = sidSpeedIsCia(tune_, song0) || tune_.rsid;
+   // RSID; everything else off. startNative's prologue must set the same.
+   const bool cia = ciaSpeed(song0);
    const uint16_t period = ntsc_ ? NTSC_TIMER : PAL_TIMER;
-   m6526_init(&cia1_);
-   m6526_init(&cia2_);
    ciaWrite(cia1_, M6526_REG_ICR, 0x7F);
    ciaWrite(cia2_, M6526_REG_ICR, 0x7F);
    ciaWrite(cia1_, M6526_REG_TALO, (uint8_t)period);
@@ -200,15 +223,49 @@ void SidMachine::start(uint8_t song0)
    vic_[0x12] = tune_.rsid ? 0x37 : 0x00;
    rasterCmp_ = tune_.rsid ? 0x137 : 0;
    vic_[0x1A] = cia ? 0x00 : 0x01;
+}
 
-   m6502_desc_t desc{};
-   desc.m6510_in_cb = portIn;
-   desc.m6510_out_cb = portOut;
-   desc.m6510_user_data = this;
-   desc.m6510_io_pullup = 0x17;
-   desc.m6510_io_floating = 0xC8;
-   pins_ = m6502_init(&cpu_, &desc);
-   cpuPort_ = 0x37;
+// The prologue, assembled by hand at NATIVE_START in the driver page:
+//
+//   SEI LDA #v STA $0314 ... STA $0319                     ; the driver's vectors, as installDriver left them
+//   wait: LDA $D012 CMP #$FA BNE wait                      ; the bottom border
+//   LDA #$7F STA $DC0D STA $DD0D LDA $DC0D LDA $DD0D       ; masks off, anything pending dropped
+//   LDA #<period STA $DC04 LDA #>period STA $DC05 LDA #$11 STA $DC0E
+//   [LDA #$81 STA $DC0D]                                   ; CIA-speed songs and RSIDs
+//   LDA #d011 STA $D011 LDA #d012 STA $D012 LDA #mask STA $D01A LDA #$FF STA $D019
+//   JMP entry
+//
+// A real C64 arrives with the KERNAL's timer interrupt running; the emulated one
+// arrives as m6526_init leaves it. Both leave it in the state start() sets. The
+// vectors are set here, behind the SEI, and not by the host's DMA, because the
+// KERNAL's interrupt would follow them into the driver before the prologue ran.
+// The wait for raster line $FA does two things. The VIC reads the screen-off bit
+// only at line $30, so a frame already past it keeps its badlines; from the bottom
+// border, init runs into a frame with none. And the timers and init start at the
+// same raster position on both machines, within the loop's 9 cycles, so a tune that
+// times itself off the raster or a CIA timer starts from the same phase.
+FLASHMEM uint16_t SidMachine::startNative(uint8_t song0, bool blank)
+{
+   if (!loaded_) return 0;
+   begin(song0);
+   const bool cia = ciaSpeed(song0);
+   const uint16_t period = ntsc_ ? NTSC_TIMER : PAL_TIMER;
+   const uint8_t d011 = (uint8_t)((tune_.rsid ? 0x9B : 0x1B) & (blank ? ~0x10 : 0xFF));
+   const uint16_t base = (uint16_t)(driverPage_ << 8), at = (uint16_t)(base + NATIVE_START);
+   uint8_t *p = mem_.ram + at;
+   auto emit = [&](std::initializer_list<uint8_t> bytes) { for (uint8_t b : bytes) *p++ = b; };
+   emit({0x78});
+   for (uint16_t v = 0x0314; v < 0x031A; v++) emit({0xA9, mem_.ram[v], 0x8D, (uint8_t)v, (uint8_t)(v >> 8)});
+   emit({0xAD, 0x12, 0xD0, 0xC9, 0xFA, 0xD0, 0xF9});
+   emit({0xA9, 0x7F, 0x8D, 0x0D, 0xDC, 0x8D, 0x0D, 0xDD, 0xAD, 0x0D, 0xDC, 0xAD, 0x0D, 0xDD});
+   emit({0xA9, (uint8_t)period, 0x8D, 0x04, 0xDC, 0xA9, (uint8_t)(period >> 8), 0x8D, 0x05, 0xDC, 0xA9, 0x11, 0x8D, 0x0E, 0xDC});
+   if (cia) emit({0xA9, 0x81, 0x8D, 0x0D, 0xDC});
+   emit({0xA9, d011, 0x8D, 0x11, 0xD0, 0xA9, (uint8_t)(tune_.rsid ? 0x37 : 0x00), 0x8D, 0x12, 0xD0});
+   emit({0xA9, (uint8_t)(cia ? 0x00 : 0x01), 0x8D, 0x1A, 0xD0, 0xA9, 0xFF, 0x8D, 0x19, 0xD0});
+   emit({0x4C, (uint8_t)base, (uint8_t)(base >> 8)});
+   mem_.kernal[0x1FFC] = (uint8_t)at;   // the emulated reset enters the prologue, as the host's jump does on the real one
+   mem_.kernal[0x1FFD] = (uint8_t)(at >> 8);
+   return at;
 }
 
 // ------------------------------------------------------------------ bus
@@ -301,7 +358,12 @@ void SidMachine::ioWrite(uint16_t a, uint8_t v)
    if (a < 0xDE00) { ciaImage_[(a >> 8) & 1][a & 0x0F] = v; ciaSel_ = (uint8_t)(1 + ((a >> 8) & 1)); return; }
    // The driver's marker store is told from a tune's own write to the same address by
    // where it comes from: a second or third SID can sit at $DFE0-$DFFF.
-   if (a == DRIVER_MARKER && (cpu_.PC >> 8) == driverPage_) { playCalls_++; return; }
+   if (a == DRIVER_MARKER && (cpu_.PC >> 8) == driverPage_)
+   {
+      playCalls_++;
+      if (recordMarker) record(a, v);
+      return;
+   }
    if (inSid(sid2_, a) || inSid(sid3_, a)) record(a, v);
 }
 
