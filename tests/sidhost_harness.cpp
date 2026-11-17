@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: MIT
-// Native driver for the SID host's emulated machine (Source/Teensy/SIDHost/):
+// Native driver for the SID host's emulated machine (host/):
 // loads a .sid, plays it, and prints the SID register image once per row so the
 // output can be checked against siddump's, or every register write with its
-// cycle. Build: c++ -std=gnu++17 -O2 -I Source/Teensy/SIDHost sidhost_harness.cpp
-// Source/Teensy/SIDHost/SidMachine.cpp
+// cycle. Build: c++ -std=gnu++17 -O2 -I host tests/sidhost_harness.cpp
+// host/SidMachine.cpp
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>

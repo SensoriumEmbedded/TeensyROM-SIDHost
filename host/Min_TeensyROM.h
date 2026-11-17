@@ -8,7 +8,8 @@
 // in an extension image (ISRs.c); SIDHost.ino supplies the two hooks the
 // EasyFlash handler then expects, and loads no modules.
 //
-//   node tools/build-firmware.mjs --target tr-plus --host-sketch Source/Teensy/SIDHost --host-code-kib 96
+//   node tools/build-host.mjs        (runs the core's tools/build-firmware.mjs --target tr-plus
+//                                      --host-sketch host --host-code-kib 96)
 //
 // 96 KiB because the emulator does not fit beside the inherited cartridge handlers
 // in 64; the module window that costs is one this host never uses.

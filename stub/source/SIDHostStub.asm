@@ -1,6 +1,6 @@
 ; SPDX-License-Identifier: MIT
 ;
-; The C64 half of the SID host extension (Source/Teensy/SIDHost/): an 8 KB
+; The C64 half of the SID host extension (host/): an 8 KB
 ; cartridge the host serves at $8000 while the tune plays on the Teensy.
 ;
 ; It draws nothing and plays nothing. The host writes the SID and the screen

@@ -1,0 +1,11 @@
+{
+  "name": "teensyrom-sidhost",
+  "private": true,
+  "type": "module",
+  "description": "SID player host extension for the TeensyROM+",
+  "scripts": {
+    "test": "node --test \"tests/**/*.test.js\"",
+    "build:host": "node tools/build-host.mjs",
+    "build:stub": "node tools/build-stub.mjs"
+  }
+}

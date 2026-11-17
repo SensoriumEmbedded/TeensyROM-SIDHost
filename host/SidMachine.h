@@ -11,7 +11,7 @@
 // CIA interrupt, and an 8 KB pseudo-KERNAL supplies only the vectors and the
 // interrupt entry/exit the driver and the tunes expect. No ROM image ships.
 //
-// Plain C++17, no Arduino dependencies; the native harness in Source/Teensy/tests/
+// Plain C++17, no Arduino dependencies; the native harness in tests/
 // compiles the same files. The caller owns every memory block (on the Teensy they
 // live in the RAM2 arena), so this class holds pointers only.
 #pragma once

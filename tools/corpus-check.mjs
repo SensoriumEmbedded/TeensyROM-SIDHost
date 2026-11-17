@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: MIT
 //
-// Runs the SID host's emulated machine (Source/Teensy/SIDHost/) over a SID
+// Runs the SID host's emulated machine (host/) over a SID
 // collection and reports what it could not play, and, given a siddump binary,
 // where its register rows differ from siddump's. Nothing here needs a board.
 //
-//   node tools/sidhost/corpus-check.mjs --hvsc <C64Music dir> [--sample 500] [--seconds 10]
+//   node tools/corpus-check.mjs --hvsc <C64Music dir> [--sample 500] [--seconds 10]
 //        [--siddump <siddump exe>] [--harness <built harness>] [--filter PSID|RSID] [--seed 1]
 //        [--list <file of relative paths>] [--out report.json] [--jobs 8]
-//   node tools/sidhost/corpus-check.mjs --hvsc <dir> --siddump <exe> --explain <relative path> [--seconds 10]
+//   node tools/corpus-check.mjs --hvsc <dir> --siddump <exe> --explain <relative path> [--seconds 10]
 //
 // Without --siddump it is a smoke pass: header rejected, driver never called,
 // slow (play spends frames in delay loops), silent (every row all-zero),
@@ -29,7 +29,7 @@ import path from 'node:path';
 import { spawnSync, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
-const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const args = process.argv.slice(2);
 const option = (name, fallback) => { const i = args.indexOf(name); return i < 0 ? fallback : args[i + 1]; };
 const hvsc = option('--hvsc', process.env.HVSC_DIR);
@@ -53,8 +53,8 @@ function buildHarness() {
   if (given) return given;
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sidhost-'));
   const exe = path.join(dir, process.platform === 'win32' ? 'harness.exe' : 'harness');
-  const built = spawnSync(compiler, ['-std=gnu++17', '-O2', '-I', path.join(root, 'Source/Teensy/SIDHost'), '-o', exe,
-    path.join(root, 'Source/Teensy/tests/sidhost_harness.cpp'), path.join(root, 'Source/Teensy/SIDHost/SidMachine.cpp')],
+  const built = spawnSync(compiler, ['-std=gnu++17', '-O2', '-I', path.join(root, 'host'), '-o', exe,
+    path.join(root, 'tests/sidhost_harness.cpp'), path.join(root, 'host/SidMachine.cpp')],
     { encoding: 'utf8', windowsHide: true });
   if (built.status !== 0) { console.error(built.stderr); process.exit(1); }
   return exe;

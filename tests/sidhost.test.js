@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// The SID host's emulated machine (Source/Teensy/SIDHost/), driven through its
+// The SID host's emulated machine (host/), driven through its
 // native harness with a PSID built here: the driver calls init and play at the
 // rate the header asks for, writes are recorded with their cycles, and the
 // header rules from SID_file_format.txt are enforced.
@@ -10,9 +10,9 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 
-import { commandExists } from '../../../tools/lib/toolchain.mjs';
+import { commandExists } from '../tools/lib/commands.mjs';
 
-const HOST_DIR = path.join(import.meta.dirname, '..', 'SIDHost');
+const HOST_DIR = path.join(import.meta.dirname, '..', 'host');
 const HARNESS_SOURCE = path.join(import.meta.dirname, 'sidhost_harness.cpp');
 
 const NOT_CI = ['', '0', 'false'];

@@ -2,7 +2,7 @@
 //
 // The SID host extension: plays a .sid on a TeensyROM+ by emulating the C64 the
 // tune runs in (SidMachine) and replaying its SID writes to the real chip by DMA,
-// while the C64 itself runs only the small cartridge in Source/C64/SIDHostStub/.
+// while the C64 itself runs only the small cartridge in stub/.
 //
 // It boots from the launch record the menu's Shift+Return leaves, serves the
 // cartridge, draws the tune's header on the C64 screen by DMA, times the emulator
@@ -10,11 +10,11 @@
 // cycle), reads keys from the cartridge's mailbox, and hands the machine back to
 // the menu.
 //
-//   node tools/build-firmware.mjs --target tr-plus --host-sketch Source/Teensy/SIDHost --host-code-kib 96
-//   python3 tools/bench/hostinstall.py build/firmware/TeensyROM+_<ver>_SIDHost.TRH
+//   node tools/build-host.mjs
+//   (install the .TRH it writes with the core's tools/bench/hostinstall.py)
 //
 // Keys on the C64: X returns to the menu (so does the menu button, or resetting
-// the C64). C captures the song as the real 6510 plays it (tools/sidhost/README.md).
+// the C64). C captures the song as the real 6510 plays it (tools/README.md).
 
 #include <SD.h>
 #include <EEPROM.h>
@@ -55,7 +55,7 @@ const VmHostId vmHostId = { VM_HOSTID_MAGIC, VM_ABI, 0, 0, "SIDHost", VM_HOST_CO
 bool VMHostIO2(uint8_t, bool) { return false; }
 void VMHostPoll() {}
 
-// The cartridge's mailbox (Source/C64/SIDHostStub/source/SIDHostStub.asm).
+// The cartridge's mailbox (stub/source/SIDHostStub.asm).
 enum : uint16_t { MailboxAddr = 0x033C };
 enum : uint8_t { MbSeq, MbKey, MbMod, MbReady, MailboxBytes, MailboxReady = 0xA5 };
 
@@ -560,7 +560,7 @@ void setup()
    attachInterrupt(digitalPinToInterrupt(PHI2_PIN), isrPHI2, RISING);
    NVIC_SET_PRIORITY(IRQ_GPIO6789, 16);
 
-   // Entered on purpose, or not at all (docs/Architecture/Extension-Hosts.md, "The marker").
+   // Entered on purpose, or not at all (the core's docs/Architecture/Extension-Hosts.md, "The marker").
    if (ReadButton == 0) runMainTRApp();
    uint32_t magic = 0;
    EEPROM.get(VM_EEP_MAGIC_ADDR, magic);

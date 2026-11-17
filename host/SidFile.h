@@ -2,7 +2,7 @@
 //
 // PSID/RSID header parsing, per HVSC's SID_file_format.txt (v1 through v4).
 // Plain C++ with no Arduino dependencies: the native harness in
-// Source/Teensy/tests/ compiles this file too.
+// tests/ compiles this file too.
 #pragma once
 #include <stdint.h>
 #include <string.h>

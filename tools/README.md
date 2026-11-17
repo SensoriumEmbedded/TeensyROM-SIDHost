@@ -1,6 +1,6 @@
 # SID host: native checks
 
-The TR+ SID player host (`Source/Teensy/SIDHost/`) plays a `.sid` by emulating
+The TR+ SID player host (`host/`) plays a `.sid` by emulating
 the tune on the Teensy and replaying its SID register writes to the real chip.
 The emulated machine is plain C++ with no Arduino dependencies, so the same
 files build on a PC and can be checked against a whole SID collection before
@@ -8,12 +8,12 @@ anything touches a board.
 
 ## The harness
 
-`Source/Teensy/tests/sidhost_harness.cpp` loads a `.sid`, runs it in the
+`tests/sidhost_harness.cpp` loads a `.sid`, runs it in the
 emulated machine and prints one row per play call: the row number and the 25
 SID registers as the tune last wrote them.
 
 ```
-c++ -std=gnu++17 -O2 -I Source/Teensy/SIDHost -o harness Source/Teensy/tests/sidhost_harness.cpp Source/Teensy/SIDHost/SidMachine.cpp
+c++ -std=gnu++17 -O2 -I host -o harness tests/sidhost_harness.cpp host/SidMachine.cpp
 ./harness some.sid -t 60            # 60 s of rows, start song
 ./harness some.sid -a 2 -n 500      # song 3 (0-based), 500 rows
 ./harness some.sid --rows frames    # a row per video frame instead of per play call
@@ -31,7 +31,7 @@ When a tune stops producing rows, the harness prints where the CPU is (PC,
 stack, `$01`, the IRQ vector, the VIC and CIA interrupt state and the bytes at
 the PC) so the cause can be read off without a debugger.
 
-`Source/Teensy/tests/sidhost.test.js` builds this harness and drives it with a
+`tests/sidhost.test.js` builds this harness and drives it with a
 PSID assembled in the test (part of `npm test`; skipped when no `c++` is on
 PATH).
 
@@ -41,8 +41,8 @@ PATH).
 directory) and reports what did not play:
 
 ```
-node tools/sidhost/corpus-check.mjs --hvsc <C64Music> --sample 2000 --seconds 10
-node tools/sidhost/corpus-check.mjs --hvsc <C64Music> --siddump <siddump exe> --filter PSID --out report.json
+node tools/corpus-check.mjs --hvsc <C64Music> --sample 2000 --seconds 10
+node tools/corpus-check.mjs --hvsc <C64Music> --siddump <siddump exe> --filter PSID --out report.json
 ```
 
 Without `--siddump` it is a smoke pass: `unsupported` (header rejected, or a
